@@ -22,7 +22,7 @@
 
   Analogies
   First-order logic           / SQL
-  Base predicate name         / Table
+  Name of safe base predicate / Table
   instance of ^ in expression / Distinct alias of table
   Comparsion predicate        / Comparison operator
   Derived predicate           / Query, subquery or view
@@ -82,12 +82,11 @@
 
      Assumes input has been desguared.
 
-     In the result, a not will only ever appear around an exists, or around an base predicate.
+     In the result, a not will only ever appear around an exists, or a base predicate.
 
      an and will never be nested directly inside an and, and likewise
      for or. Although note we don't go the whole hog and convert these
-     boolean expressions to CNF or DNF. If we went to DNF we'd have
-     something expressible via datalog-style horn clauses."
+     boolean expressions to CNF or DNF."
   [expr]
   (match [expr]
          [(('and & clauses) :seq)]
@@ -125,8 +124,9 @@
 
 (defn free-vars
   "Returns the free variables in the expression.
-   Also checks and complains if a quantifier within it tries to close over a non-free variable."
-  [expr]
+   Performs some syntax checks while it's at it, in particular
+   complains if a quantifier tries to close over a non-free variable"
+   [expr]
   (match [expr]
          [(('and & clauses) :seq)]
          (apply set/union (map free-vars clauses))
@@ -157,19 +157,80 @@
                           " which isn't free in inner expression " inner)))))
 
          [((predicate & arguments) :seq)]
-         (set arguments)))
+         (if (empty? arguments)
+           ;; we disallow these not because they're impossible to cope
+           ;; with, but just because they're not very useful in
+           ;; practise and they're fiddly to map to sql (would
+           ;; probably need special-casing as boolean global variables
+           ;; rather than tables)
+           (throw (IllegalArgumentException.
+                   (str "Nullary base predicates not supported: " expr)))
+           (set arguments))))
 
-(def unsafe-predicate?
+(def psuedosafe-base-predicate?
   "Special predicates which aren't in general represented by finite
   relations and aren't safe. (In sql, these are built-in comparison
   operators rather than tables)"
-  '#{= != < > >= <= })
+  '#{= != < > >= <=})
 
-(defn negated-safe?
+(defn- not-expr?
+  "Returns the inner expression if this is a (not ...),
+   otherwise nil."
   [expr]
   (match [expr]
-         [(('not inner) :seq)] (safe? inner)
-         :else false))
+         [(('not inner) :seq)] inner
+         :else nil))
+
+(defn safe-vars
+  "An expression is safe if all its free variables are safe.
+
+   It can also be pseudosafe -- not safe but able to be made safe if
+   and-ed with safe expressions restricting any unsafe free variables.
+
+   Finally an expression can be neither safe nor pseudosafe, if
+   somewhere within it a variable which is not safe is closed over by
+   a quantifier.
+
+   This returns the free variables in an expression which are safe, and
+   raises an exception if the expression is not psuedosafe."
+  [expr]
+  (match [expr]
+         [(('and & clauses) :seq)]
+         ;; a var is safe in a conjunction iff it's safe in any
+         ;; clause, and pseudo-safe in every clause.
+         (apply set/union (map safe-vars clauses))
+
+         [(('or & clauses) :seq)]
+         ;; a var is safe in a disjunction iff it's safe in every clause
+         (apply set/intersection (map safe-vars clauses))
+
+         [(('not inner) :seq)]
+         (do
+           ;; raise exception if inner expression not psuedosafe:
+           (safe-vars inner)
+           ;; no variable in a negation is safe:
+           #{})
+
+         [(('exists [var] inner) :seq)]
+         ;; if the variable which the exists closes over is not
+         ;; safe, the expression is neither safe nor psuedosafe.
+         ;; otherwise, a variable is safe provided it's safe inside
+         ;; the exists.
+         (let [inner-safe-vars (safe-vars inner)]
+           (if (contains? inner-safe-vars var)
+             (set/difference inner-safe-vars #{var})
+             (throw (IllegalArgumentException.
+                     (str "Quantifier closes over unsafe variable " var
+                          " in expression " inner)))))
+
+         [((predicate & arguments) :seq)]
+         (if (psuedosafe-base-predicate? predicate)
+           ;; a pseudosafe (but not safe) base predicate has no safe
+           ;; variables
+           #{}
+           ;; a safe base predicate has all its arguments as safe
+           ;; variables
+           (set arguments))))
 
 (defn safe?
   "Checks to see if a desguared and normalized expression is 'safe'
@@ -178,49 +239,34 @@
   Safeness implies that there will be finitely many tuples satisfying
   it, but also a stronger property: that its interpretation doesn't
   depend on any assumptions about the full set of values in the domain
-  which unrestrcited free variables range over."
+  which unrestrcited free variables range over.
+
+  A safe expression will be either:
+
+  * An 'or' whose clauses are safe expressions all over the same set
+    of free variables
+
+  * An 'and' where every free variable is included in at least one
+    safe clause, and all clauses are at least pseudosafe.
+
+  * A safe expression surrounded by an existential quantifier
+
+  * A negation of a safe expression with no free variables
+
+  * A safe base predicate
+
+  A pseudosafe expression may not be safe, but is able to be made safe if
+  and-ed with safe expressions restricting any unsafe free variables. It
+  can be:
+
+  * A safe expression
+  * A pseudosafe base predicate like (> x y)
+  * An exists closing over a safe variable in a pseudosafe expression
+  * Any boolean expression built from pseudosafe expressions using not, and, or.
+
+  This function will raise an exception if the expression is not even pseudosafe.
+
+  Also recall that after the normalisation step, a not only ever appears before
+  a base predicate or an exists, ands are not nested, ors are not nested."
   [expr]
-  (match [expr]
-         [(('and & clauses) :seq)]
-         (let [vars (free-vars expr)
-               safe-vars (apply set/union (map free-vars (filter safe? clauses)))]
-           ;; every free variable must be present in at least one safe
-           ;; clause (TODO: or is implied by the expression to be
-           ;; equal to a variable which is in a safe clause; would
-           ;; need to further normalize the expression (say to CNF) to
-           ;; determine this I think).
-           ;; any unsafe clauses must be negations of safe clauses.
-           (and (= vars safe-vars)
-                (every? negated-safe? (filter (comp not safe?) clauses))))
-
-         [(('or & clauses) :seq)]
-         (let [vars (free-vars expr)]
-           ;; every clause must be safe and every clause must
-           ;; reference (hence restrict to be safe) every free variable.
-           (every? (fn [clause]
-                     (and (safe? clause)
-                          (= (free-vars clause) vars)))
-                   clauses))
-
-         [(('not inner) :seq)]
-         ;; a not expression can only be safe if it has no free
-         ;; variables, otherwise the variables could range over the
-         ;; entire (unspecified, possibly infinite) domain, minus the
-         ;; rows satisfying the inner expression, hence could in
-         ;; general be infinite and depnds on what is in the overall
-         ;; domain (which we want to avoid any dependence on).
-         ;; Even if there are no free variables, the inner expression
-         ;; needs to be safe too, otherwise we could have things like:
-         ;; (not (exists [a] (= a a)))
-         ;; which isn't translatable into SQL and depends on what's in
-         ;; the domain (the example asserts the domain is empty)
-         (and (empty? (free-vars inner))
-              (safe? inner))
-
-         [(('exists [var] inner) :seq)]
-         ;; this is like requiring that the quantifier is restricted,
-         ;; i.e. "exists x in foo such that"
-         (safe? inner)
-
-         [((predicate & arguments) :seq)]
-         (not (unsafe-predicate? predicate))))
+  (= (free-vars expr) (safe-vars expr)))
