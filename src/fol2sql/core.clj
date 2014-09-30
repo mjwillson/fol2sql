@@ -1,6 +1,7 @@
 (ns fol2sql.core
   (:require [clojure.core.match :refer [match]]
-            [clojure.set :as set]))
+            [clojure.set :as set]
+            [clojure.string :as str]))
 
 (comment
   "FoL syntax in clojure"
@@ -125,47 +126,53 @@
 (defn free-vars
   "Returns the free variables in the expression.
    Performs some syntax checks while it's at it, in particular
-   complains if a quantifier tries to close over a non-free variable"
-   [expr]
-  (match [expr]
-         [(('and & clauses) :seq)]
-         (apply set/union (map free-vars clauses))
+   complains if a quantifier tries to close over a non-free variable.
 
-         [(('or & clauses) :seq)]
-         (apply set/union (map free-vars clauses))
+   You can specify some constants, which will then not be treated as
+   free in the expression."
+  ([expr]
+     (free-vars expr #{}))
+  ([expr constants]
+     (match [expr]
+            [(('and & clauses) :seq)]
+            (apply set/union (map #(free-vars % constants) clauses))
 
-         [(('implies hypothesis conclusion) :seq)]
-         (set/union (free-vars hypothesis) (free-vars conclusion))
+            [(('or & clauses) :seq)]
+            (apply set/union (map #(free-vars % constants) clauses))
 
-         [(('not inner) :seq)]
-         (free-vars inner)
+            [(('implies hypothesis conclusion) :seq)]
+            (set/union (free-vars hypothesis constants)
+                       (free-vars conclusion constants))
 
-         [(('exists [var] inner) :seq)]
-         (let [inner-free-vars (free-vars inner)]
-           (if (contains? inner-free-vars var)
-             (set/difference inner-free-vars #{var})
-             (throw (IllegalArgumentException.
-                     (str "Quantifier can't close over variable " var
-                          " which isn't free in inner expression " inner)))))
+            [(('not inner) :seq)]
+            (free-vars inner constants)
 
-         [(('forall [var] inner) :seq)]
-         (let [inner-free-vars (free-vars inner)]
-           (if (contains? inner-free-vars var)
-             (set/difference inner-free-vars #{var})
-             (throw (IllegalArgumentException.
-                     (str "Quantifier can't close over variable " var
-                          " which isn't free in inner expression " inner)))))
+            [(('exists [var] inner) :seq)]
+            (let [inner-free-vars (free-vars inner constants)]
+              (if (contains? inner-free-vars var)
+                (set/difference inner-free-vars #{var})
+                (throw (IllegalArgumentException.
+                        (str "Quantifier can't close over variable " var
+                             " which isn't free in expression " inner)))))
 
-         [((predicate & arguments) :seq)]
-         (if (empty? arguments)
-           ;; we disallow these not because they're impossible to cope
-           ;; with, but just because they're not very useful in
-           ;; practise and they're fiddly to map to sql (would
-           ;; probably need special-casing as boolean global variables
-           ;; rather than tables)
-           (throw (IllegalArgumentException.
-                   (str "Nullary base predicates not supported: " expr)))
-           (set arguments))))
+            [(('forall [var] inner) :seq)]
+            (let [inner-free-vars (free-vars inner constants)]
+              (if (contains? inner-free-vars var)
+                (set/difference inner-free-vars #{var})
+                (throw (IllegalArgumentException.
+                        (str "Quantifier can't close over variable " var
+                             " which isn't free in expression " inner)))))
+
+            [((predicate & arguments) :seq)]
+            (if (empty? arguments)
+              ;; we disallow these not because they're impossible to cope
+              ;; with, but just because they're not very useful in
+              ;; practise and they're fiddly to map to sql (would
+              ;; probably need special-casing as boolean global variables
+              ;; rather than tables)
+              (throw (IllegalArgumentException.
+                      (str "Nullary base predicates not supported: " expr)))
+              (set/difference (set arguments) constants)))))
 
 (def psuedosafe-base-predicate?
   "Special predicates which aren't in general represented by finite
@@ -193,44 +200,49 @@
 
    This returns the free variables in an expression which are safe, and
    raises an exception if the expression is not psuedosafe."
-  [expr]
-  (match [expr]
-         [(('and & clauses) :seq)]
-         ;; a var is safe in a conjunction iff it's safe in any
-         ;; clause, and pseudo-safe in every clause.
-         (apply set/union (map safe-vars clauses))
+  ([expr]
+     (safe-vars expr #{}))
+  ([expr constants]
+     (match [expr]
+            [(('and & clauses) :seq)]
+            ;; a var is safe in a conjunction iff it's safe in any
+            ;; clause, and pseudo-safe in every clause.
+            (apply set/union (map #(safe-vars % constants) clauses))
 
-         [(('or & clauses) :seq)]
-         ;; a var is safe in a disjunction iff it's safe in every clause
-         (apply set/intersection (map safe-vars clauses))
+            [(('or & clauses) :seq)]
+            ;; a var is safe in a disjunction iff it's safe in every clause
+            (apply set/intersection (map #(safe-vars % constants) clauses))
 
-         [(('not inner) :seq)]
-         (do
-           ;; raise exception if inner expression not psuedosafe:
-           (safe-vars inner)
-           ;; no variable in a negation is safe:
-           #{})
+            [(('not inner) :seq)]
+            (do
+              ;; raise exception if inner expression not psuedosafe:
+              (safe-vars inner constants)
+              ;; no variable in a negation is safe:
+              #{})
 
-         [(('exists [var] inner) :seq)]
-         ;; if the variable which the exists closes over is not
-         ;; safe, the expression is neither safe nor psuedosafe.
-         ;; otherwise, a variable is safe provided it's safe inside
-         ;; the exists.
-         (let [inner-safe-vars (safe-vars inner)]
-           (if (contains? inner-safe-vars var)
-             (set/difference inner-safe-vars #{var})
-             (throw (IllegalArgumentException.
-                     (str "Quantifier closes over unsafe variable " var
-                          " in expression " inner)))))
+            [(('exists [var] inner) :seq)]
+            ;; if the variable which the exists closes over is not
+            ;; safe, the expression is neither safe nor psuedosafe.
+            ;; otherwise, a variable is safe provided it's safe inside
+            ;; the exists.
+            (let [inner-safe-vars (safe-vars inner constants)]
+              (if (contains? inner-safe-vars var)
+                (set/difference inner-safe-vars #{var})
+                (throw (IllegalArgumentException.
+                        (str "Quantifier closes over unsafe variable " var
+                             " in expression " inner)))))
 
-         [((predicate & arguments) :seq)]
-         (if (psuedosafe-base-predicate? predicate)
-           ;; a pseudosafe (but not safe) base predicate has no safe
-           ;; variables
-           #{}
-           ;; a safe base predicate has all its arguments as safe
-           ;; variables
-           (set arguments))))
+            [((predicate & arguments) :seq)]
+            (if (psuedosafe-base-predicate? predicate)
+              ;; a pseudosafe (but not safe) base predicate has no safe
+              ;; variables
+              #{}
+              ;; a safe base predicate has all its non-constant
+              ;; arguments as safe variables.
+              ;; (constants aren't unsafe, but they're just not
+              ;; free variables so there's no need to classify their
+              ;; safety at all)
+              (set/difference (set arguments) constants)))))
 
 (defn safe?
   "Checks to see if a desguared and normalized expression is 'safe'
@@ -268,5 +280,132 @@
 
   Also recall that after the normalisation step, a not only ever appears before
   a base predicate or an exists, ands are not nested, ors are not nested."
+  ([expr]
+     (= (free-vars expr) (safe-vars expr)))
+  ([expr constants]
+     (= (free-vars expr constants) (safe-vars expr constants))))
+
+
+(defn- and-clauses
   [expr]
-  (= (free-vars expr) (safe-vars expr)))
+  (match [expr]
+         [(('and & clauses) :seq)] clauses
+         [other] [other]))
+
+(defn- table-binding
+  [safe-expr constants]
+  (-> [safe-expr]
+      (match
+       [(((:or 'and 'or 'not 'exists) & _) :seq)]
+       ;; a subquery
+       (let [alias (gensym 'subquery)]
+         {:alias alias
+          :expr (str "(" (generate-select safe-expr #{} constants) ")")
+          :var-to-column (->> (free-vars safe-expr constants)
+                              ;; free variables in a subquery are
+                              ;; selected in sort order
+                              (sort)
+                              ;; and the free variable names are
+                              ;; reused as column names
+                              (map (fn [var] {:var var :table-alias alias :column var})))
+          ;; we leave any constants to be handled within the subquery
+          :const-to-column {}})
+
+       [((base-predicate & arguments) :seq)]
+       (let [alias (gensym base-predicate)]
+         {:alias alias
+          :expr base-predicate
+          ;; non-constant variable to the index of the slot in the base
+          ;; predicate, which for now we use as a column name. so foo.0,
+          ;; foo.1 etc
+          :var-to-column (keep-indexed (fn [index arg]
+                                         (when-not (contains? constants arg)
+                                           {:var arg :table-alias alias :column index}))
+                                       arguments)
+          :const-to-column (keep-indexed (fn [index arg]
+                                           (when (contains? constants arg)
+                                             {:const arg :table-alias alias :column index}))
+                                         arguments)}))))
+
+(defn- table-bindings-to-var-bindings
+  [table-bindings]
+  (->> table-bindings
+       (mapcat :var-to-column)
+       (group-by :var)))
+
+(defn- var-bindings-to-equality-conditions
+  [var-bindings]
+  (mapcat (fn [[var columns]]
+            (->> columns
+                 (partition 2 1)
+                 (map (fn [[c1 c2]]
+                        (str (:table-alias c1) "." (:column c1)
+                             " = "
+                             (:table-alias c2) "." (:column c2)))))
+            )
+          var-bindings))
+
+(defn- table-bindings-to-constant-conditions
+  [table-bindings]
+  (->> table-bindings
+       (mapcat :const-to-column)
+       (map (fn [c]
+              (str (:table-alias c) "." (:column c)
+                   " = "
+                   (:const c))))))
+
+(defn- table-binding-to-from-expr
+  [table-binding]
+  (str (:expr table-binding) " AS " (:alias table-binding)))
+
+(defn- var-bindings-to-select-exprs
+  [var-bindings exclude-vars]
+  (->> var-bindings
+       (sort-by first)
+       (filter (fn [[var _]] (not (contains? exclude-vars var))))
+       (map (fn [[var [binding & _]]]
+              (str (:table-alias binding) "." (:column binding) " AS " var)))))
+
+(defn- generate-condition
+  "Converts a pseudosafe expression into an SQL condition"
+  [expr constants])
+
+(defn- generate-select
+  "Converts a safe expression to an SQL select query."
+  ([expr]
+     (generate-select expr #{} #{}))
+  ([expr exclude-vars constants]
+     (if (empty? (free-vars expr constants))
+       ;; a special top-level select to select a boolean expression,
+       ;; since sql doesn't support selecting an empty tuple.
+       (str "SELECT " (generate-condition expr constants))
+       ;; an expression with some free variables:
+       (match [expr]
+              [(('and & clauses) :seq)]
+              (let [safe-clauses (filter #(safe? % constants) clauses)
+                    pseudosafe-clauses (filter #(not (safe? % constants)) clauses)
+                    tables (map #(table-binding % constants) safe-clauses)
+                    vars (table-bindings-to-var-bindings tables)
+                    eq-conds (var-bindings-to-equality-conditions vars)
+                    const-conds (table-bindings-to-constant-conditions tables)
+                    other-conds (map #(generate-condition % constants) pseudosafe-clauses)
+                    conds (concat eq-conds const-conds other-conds)
+                    from-exprs (map table-binding-to-from-expr tables)
+                    select-exprs (var-bindings-to-select-exprs vars exclude-vars)]
+
+                (str "SELECT "
+                     (when-not (empty? exclude-vars) "DISTINCT ")
+                     (str/join ", " select-exprs)
+                     " FROM "
+                     (str/join ", " from-exprs)
+                     (when-not (empty? conds)
+                       (str " WHERE " (str/join " AND " conds)))))
+
+              [(('or & clauses) :seq)]
+              (str/join " UNION " (map #(generate-select % exclude-vars constants) clauses))
+
+              [(('exists [var] inner) :seq)]
+              (generate-select inner (set/union exclude-vars #{var}) constants)
+
+              [base-predicate]
+              (generate-select (list 'and base-predicate) exclude-vars constants)))))
