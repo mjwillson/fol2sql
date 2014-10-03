@@ -307,6 +307,10 @@ p  operators rather than tables)"
     expr
     (bindings expr)))
 
+;; clojure needs us to def ahead for mutual recursion
+(def generate-select)
+(def generate-and-clauses-select)
+
 (defn- table-binding
   [safe-expr var-bindings]
   (-> [safe-expr]
