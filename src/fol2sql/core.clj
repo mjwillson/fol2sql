@@ -187,6 +187,14 @@
 p  operators rather than tables)"
   '#{= != < > >= <=})
 
+(def to-negation
+  '{= !=
+    != =
+    < >=
+    > <=
+    <= >
+    >= <})
+
 (defn- not-expr?
   "Returns the inner expression if this is a (not ...),
    otherwise nil."
@@ -393,7 +401,7 @@ p  operators rather than tables)"
 
 (defn- generate-condition
   "Converts a pseudosafe expression into an SQL condition"
-  [expr var-bindings]
+  [expr var-bindings & [not]]
   (match [expr]
          [(('and & clauses) :seq)]
          (->> clauses
@@ -409,70 +417,87 @@ p  operators rather than tables)"
 
 
          [(('not inner) :seq)]
-         (str "NOT ("
-              (generate-condition inner var-bindings)
-              ")")
+         ;; NOT can only happen outside a base pred or an exists. Both
+         ;; these handle it specially:
+         (generate-condition inner var-bindings true)
 
          [(('exists [var] inner) :seq)]
          (let [inner-free-vars (free-vars inner)
                exclude-vars (set/difference inner-free-vars #{var})]
-           (str "EXISTS ("
+           (str (when not "NOT ")
+                "EXISTS ("
                 (generate-select inner exclude-vars var-bindings
                                  :no-distinct-needed true :no-as-needed true)
                 ")"))
 
          [((predicate & arguments) :seq)]
          (if (psuedosafe-base-predicate? predicate)
-           ;; assume for now they're all binary operators:
+           ;; assume for now they're all binary operators which can be
+           ;; negated:
            (str (bound-var-or-const (first arguments) var-bindings)
-                " " predicate " "
+                " "
+                (if not (to-negation predicate) predicate)
+                " "
                 (bound-var-or-const (second arguments) var-bindings))
            ;; a safe base predicate -- need to write out as an
            ;; EXISTS (SELECT true FROM table WHERE table.col = ...)
            ;; condition.
            ;; (We could also write this as an IN subquery, but EXISTS
            ;; works for zero arity too whereas IN doesn't)
-           (str "EXISTS ("
-                (generate-select expr #{} var-bindings
-                                 :no-distinct-needed true :no-as-needed true)
+           (str (when not "NOT ")
+                "EXISTS ("
+                (generate-and-clauses-select [expr] #{} var-bindings
+                                             :no-distinct-needed true :no-as-needed true)
                 ")"))))
+
+
+(defn- generate-and-clauses-select
+  [clauses exclude-vars var-bindings & {:keys [no-distinct-needed no-as-needed]}]
+  (let [safe-clauses (filter #(safe? % (keys var-bindings)) clauses)
+        pseudosafe-clauses (filter #(not (safe? % (keys var-bindings))) clauses)
+        tables (map #(table-binding % var-bindings) safe-clauses)
+        var->cols (column-equiv-classes tables)
+        equiv-conds (column-equiv-conds var->cols)
+        eq-conds (column-eq-expr-conds tables)
+        new-var-bindings (merge
+                          var-bindings
+                          (column-var-bindings var->cols))
+        other-conds (map
+                     #(generate-condition % new-var-bindings)
+                     pseudosafe-clauses)
+        conds (concat equiv-conds eq-conds other-conds)
+        from-exprs (map from-expr tables)
+        select-exprs (select-exprs var->cols exclude-vars no-as-needed)]
+    (str "SELECT "
+         (when-not no-distinct-needed "DISTINCT ")
+         (if (empty? select-exprs)
+           "true"
+           (str/join ", " select-exprs))
+         " FROM "
+         (str/join ", " from-exprs)
+         (when-not (empty? conds)
+           (str " WHERE " (str/join " AND " conds))))))
 
 (defn- generate-select
   "Converts a safe expression to an SQL select query."
   ([expr]
      (generate-select expr #{} {}))
   ([expr exclude-vars var-bindings & {:keys [no-distinct-needed no-as-needed]}]
-     (if (empty? (free-vars expr (keys var-bindings)))
-       ;; a special top-level select to select a boolean expression,
-       ;; since sql doesn't support selecting an empty tuple.
+     (if (and (empty? (free-vars expr (keys var-bindings)))
+              (or (psuedosafe-base-predicate? (first expr))
+                  (#{'and 'or 'not} (first expr))))
+       ;; Expressions with no free variables get implemented as SELECT
+       ;; <boolean expr>, except where it's a base predicate filled
+       ;; out with constants, in which case we use a more concise
+       ;; SELECT DISTINCT true FROM base_pred. (better than SELECT
+       ;; EXISTS (SELECT true FROM base_pred).
        (str "SELECT " (generate-condition expr var-bindings))
        ;; an expression with some free variables:
        (match [expr]
               [(('and & clauses) :seq)]
-              (let [safe-clauses (filter #(safe? % (keys var-bindings)) clauses)
-                    pseudosafe-clauses (filter #(not (safe? % (keys var-bindings))) clauses)
-                    tables (map #(table-binding % var-bindings) safe-clauses)
-                    var->cols (column-equiv-classes tables)
-                    equiv-conds (column-equiv-conds var->cols)
-                    eq-conds (column-eq-expr-conds tables)
-                    new-var-bindings (merge
-                                      var-bindings
-                                      (column-var-bindings var->cols))
-                    other-conds (map
-                                 #(generate-condition % new-var-bindings)
-                                 pseudosafe-clauses)
-                    conds (concat equiv-conds eq-conds other-conds)
-                    from-exprs (map from-expr tables)
-                    select-exprs (select-exprs var->cols exclude-vars no-as-needed)]
-                (str "SELECT "
-                     (when-not no-distinct-needed "DISTINCT ")
-                     (if (empty? select-exprs)
-                       "true"
-                       (str/join ", " select-exprs))
-                     " FROM "
-                     (str/join ", " from-exprs)
-                     (when-not (empty? conds)
-                       (str " WHERE " (str/join " AND " conds)))))
+              (generate-and-clauses-select clauses exclude-vars var-bindings
+                                           :no-distinct-needed no-distinct-needed
+                                           :no-as-needed no-as-needed)
 
               [(('or & clauses) :seq)]
               (str/join " UNION " (map #(generate-select
@@ -487,9 +512,9 @@ p  operators rather than tables)"
                                :no-as-needed no-as-needed)
 
               [base-predicate]
-              (generate-select (list 'and base-predicate) exclude-vars var-bindings
-                               :no-distinct-needed no-distinct-needed
-                               :no-as-needed no-as-needed)))))
+              (generate-and-clauses-select [base-predicate] exclude-vars var-bindings
+                                           :no-distinct-needed no-distinct-needed
+                                           :no-as-needed no-as-needed)))))
 
 (defn to-sql
   [expr]
