@@ -1,7 +1,9 @@
 (ns fol2sql.core
+  (:refer-clojure :exclude [gensym])
   (:require [clojure.core.match :refer [match]]
             [clojure.set :as set]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [fol2sql.pretty-gensym :refer [gensym with-pretty-gensym]]))
 
 (comment
   "FoL syntax in clojure"
@@ -123,6 +125,10 @@
 
          [atom] atom))
 
+(defn- constant?
+  [expr]
+  (or (string? expr) (number? expr)))
+
 (defn free-vars
   "Returns the free variables in the expression.
    Performs some syntax checks while it's at it, in particular
@@ -132,23 +138,23 @@
    free in the expression."
   ([expr]
      (free-vars expr #{}))
-  ([expr constants]
+  ([expr bound-vars]
      (match [expr]
             [(('and & clauses) :seq)]
-            (apply set/union (map #(free-vars % constants) clauses))
+            (apply set/union (map #(free-vars % bound-vars) clauses))
 
             [(('or & clauses) :seq)]
-            (apply set/union (map #(free-vars % constants) clauses))
+            (apply set/union (map #(free-vars % bound-vars) clauses))
 
             [(('implies hypothesis conclusion) :seq)]
-            (set/union (free-vars hypothesis constants)
-                       (free-vars conclusion constants))
+            (set/union (free-vars hypothesis bound-vars)
+                       (free-vars conclusion bound-vars))
 
             [(('not inner) :seq)]
-            (free-vars inner constants)
+            (free-vars inner bound-vars)
 
             [(('exists [var] inner) :seq)]
-            (let [inner-free-vars (free-vars inner constants)]
+            (let [inner-free-vars (free-vars inner bound-vars)]
               (if (contains? inner-free-vars var)
                 (set/difference inner-free-vars #{var})
                 (throw (IllegalArgumentException.
@@ -156,7 +162,7 @@
                              " which isn't free in expression " inner)))))
 
             [(('forall [var] inner) :seq)]
-            (let [inner-free-vars (free-vars inner constants)]
+            (let [inner-free-vars (free-vars inner bound-vars)]
               (if (contains? inner-free-vars var)
                 (set/difference inner-free-vars #{var})
                 (throw (IllegalArgumentException.
@@ -172,12 +178,13 @@
               ;; rather than tables)
               (throw (IllegalArgumentException.
                       (str "Nullary base predicates not supported: " expr)))
-              (set/difference (set arguments) constants)))))
+              (set/select (comp not constant?)
+                          (set/difference (set arguments) bound-vars))))))
 
 (def psuedosafe-base-predicate?
   "Special predicates which aren't in general represented by finite
   relations and aren't safe. (In sql, these are built-in comparison
-  operators rather than tables)"
+p  operators rather than tables)"
   '#{= != < > >= <=})
 
 (defn- not-expr?
@@ -202,21 +209,21 @@
    raises an exception if the expression is not psuedosafe."
   ([expr]
      (safe-vars expr #{}))
-  ([expr constants]
+  ([expr bound-vars]
      (match [expr]
             [(('and & clauses) :seq)]
             ;; a var is safe in a conjunction iff it's safe in any
             ;; clause, and pseudo-safe in every clause.
-            (apply set/union (map #(safe-vars % constants) clauses))
+            (apply set/union (map #(safe-vars % bound-vars) clauses))
 
             [(('or & clauses) :seq)]
             ;; a var is safe in a disjunction iff it's safe in every clause
-            (apply set/intersection (map #(safe-vars % constants) clauses))
+            (apply set/intersection (map #(safe-vars % bound-vars) clauses))
 
             [(('not inner) :seq)]
             (do
               ;; raise exception if inner expression not psuedosafe:
-              (safe-vars inner constants)
+              (safe-vars inner bound-vars)
               ;; no variable in a negation is safe:
               #{})
 
@@ -225,7 +232,7 @@
             ;; safe, the expression is neither safe nor psuedosafe.
             ;; otherwise, a variable is safe provided it's safe inside
             ;; the exists.
-            (let [inner-safe-vars (safe-vars inner constants)]
+            (let [inner-safe-vars (safe-vars inner bound-vars)]
               (if (contains? inner-safe-vars var)
                 (set/difference inner-safe-vars #{var})
                 (throw (IllegalArgumentException.
@@ -235,14 +242,15 @@
             [((predicate & arguments) :seq)]
             (if (psuedosafe-base-predicate? predicate)
               ;; a pseudosafe (but not safe) base predicate has no safe
-              ;; variables
+              ;; free variables
               #{}
               ;; a safe base predicate has all its non-constant
               ;; arguments as safe variables.
-              ;; (constants aren't unsafe, but they're just not
+              ;; (bound-vars aren't unsafe, but they're just not
               ;; free variables so there's no need to classify their
               ;; safety at all)
-              (set/difference (set arguments) constants)))))
+              (set/select (comp not constant?)
+                          (set/difference (set arguments) bound-vars))))))
 
 (defn safe?
   "Checks to see if a desguared and normalized expression is 'safe'
@@ -282,33 +290,33 @@
   a base predicate or an exists, ands are not nested, ors are not nested."
   ([expr]
      (= (free-vars expr) (safe-vars expr)))
-  ([expr constants]
-     (= (free-vars expr constants) (safe-vars expr constants))))
+  ([expr bound-vars]
+     (= (free-vars expr bound-vars) (safe-vars expr bound-vars))))
 
-
-(defn- and-clauses
-  [expr]
-  (match [expr]
-         [(('and & clauses) :seq)] clauses
-         [other] [other]))
+(defn- bound-var-or-const
+  [expr bindings]
+  (if (constant? expr)
+    expr
+    (bindings expr)))
 
 (defn- table-binding
-  [safe-expr constants]
+  [safe-expr var-bindings]
   (-> [safe-expr]
       (match
        [(((:or 'and 'or 'not 'exists) & _) :seq)]
        ;; a subquery
        (let [alias (gensym 'subquery)]
          {:alias alias
-          :expr (str "(" (generate-select safe-expr #{} constants) ")")
-          :var-to-column (->> (free-vars safe-expr constants)
+          :expr (str "(" (generate-select safe-expr #{} var-bindings) ")")
+          :var-to-column (->> (free-vars safe-expr (keys var-bindings))
                               ;; free variables in a subquery are
                               ;; selected in sort order
                               (sort)
                               ;; and the free variable names are
                               ;; reused as column names
                               (map (fn [var] {:var var :table-alias alias :column var})))
-          ;; we leave any constants to be handled within the subquery
+          ;; we leave any constants to be handled within the subquery,
+          ;; we passed our bindings for them along to generate-select.
           :const-to-column {}})
 
        [((base-predicate & arguments) :seq)]
@@ -318,23 +326,29 @@
           ;; non-constant variable to the index of the slot in the base
           ;; predicate, which for now we use as a column name. so foo.0,
           ;; foo.1 etc
-          :var-to-column (keep-indexed (fn [index arg]
-                                         (when-not (contains? constants arg)
-                                           {:var arg :table-alias alias :column index}))
-                                       arguments)
-          :const-to-column (keep-indexed (fn [index arg]
-                                           (when (contains? constants arg)
-                                             {:const arg :table-alias alias :column index}))
-                                         arguments)}))))
+          :var-eq-column (keep-indexed
+                          (fn [index arg]
+                            (when-not (bound-var-or-const arg var-bindings)
+                              {:var arg
+                               :table-alias alias
+                               :column (str "column_" index)}))
+                          arguments)
+          :column-eq-expr (keep-indexed
+                           (fn [index arg]
+                             (when-let [expr (bound-var-or-const arg var-bindings)]
+                               {:expr expr
+                                :table-alias alias
+                                :column (str "column_" index)}))
+                           arguments)}))))
 
-(defn- table-bindings-to-var-bindings
+(defn- column-equiv-classes
   [table-bindings]
   (->> table-bindings
-       (mapcat :var-to-column)
+       (mapcat :var-eq-column)
        (group-by :var)))
 
-(defn- var-bindings-to-equality-conditions
-  [var-bindings]
+(defn- column-equiv-conds
+  [var->cols]
   (mapcat (fn [[var columns]]
             (->> columns
                  (partition 2 1)
@@ -343,69 +357,144 @@
                              " = "
                              (:table-alias c2) "." (:column c2)))))
             )
-          var-bindings))
+          var->cols))
 
-(defn- table-bindings-to-constant-conditions
+(defn- column-eq-expr-conds
   [table-bindings]
   (->> table-bindings
-       (mapcat :const-to-column)
+       (mapcat :column-eq-expr)
        (map (fn [c]
               (str (:table-alias c) "." (:column c)
                    " = "
-                   (:const c))))))
+                   (:expr c))))))
 
-(defn- table-binding-to-from-expr
+(defn- from-expr
   [table-binding]
-  (str (:expr table-binding) " AS " (:alias table-binding)))
+  (let [{:keys [expr alias]} table-binding]
+    (if (= alias expr)
+      expr
+      (str expr " AS " alias))))
 
-(defn- var-bindings-to-select-exprs
-  [var-bindings exclude-vars]
-  (->> var-bindings
+(defn- select-exprs
+  [var->cols exclude-vars skip-as]
+  (->> var->cols
        (sort-by first)
        (filter (fn [[var _]] (not (contains? exclude-vars var))))
-       (map (fn [[var [binding & _]]]
-              (str (:table-alias binding) "." (:column binding) " AS " var)))))
+       (map (fn [[var [col & _]]]
+              (str (:table-alias col) "." (:column col)
+                   (when-not skip-as (str " AS " var)))))))
+
+(defn- column-var-bindings
+  [var->cols]
+  (reduce (fn [result [var [col & _]]]
+            (assoc result var (str (:table-alias col) "." (:column col))))
+          {}
+          var->cols))
 
 (defn- generate-condition
   "Converts a pseudosafe expression into an SQL condition"
-  [expr constants])
+  [expr var-bindings]
+  (match [expr]
+         [(('and & clauses) :seq)]
+         (->> clauses
+              (map #(generate-condition % var-bindings))
+              (map #(str "(" % ")"))
+              (str/join " AND "))
+
+         [(('or & clauses) :seq)]
+         (->> clauses
+              (map #(generate-condition % var-bindings))
+              (map #(str "(" % ")"))
+              (str/join " OR "))
+
+
+         [(('not inner) :seq)]
+         (str "NOT ("
+              (generate-condition inner var-bindings)
+              ")")
+
+         [(('exists [var] inner) :seq)]
+         (let [inner-free-vars (free-vars inner)
+               exclude-vars (set/difference inner-free-vars #{var})]
+           (str "EXISTS ("
+                (generate-select inner exclude-vars var-bindings
+                                 :no-distinct-needed true :no-as-needed true)
+                ")"))
+
+         [((predicate & arguments) :seq)]
+         (if (psuedosafe-base-predicate? predicate)
+           ;; assume for now they're all binary operators:
+           (str (bound-var-or-const (first arguments) var-bindings)
+                " " predicate " "
+                (bound-var-or-const (second arguments) var-bindings))
+           ;; a safe base predicate -- need to write out as an
+           ;; EXISTS (SELECT true FROM table WHERE table.col = ...)
+           ;; condition.
+           ;; (We could also write this as an IN subquery, but EXISTS
+           ;; works for zero arity too whereas IN doesn't)
+           (str "EXISTS ("
+                (generate-select expr #{} var-bindings
+                                 :no-distinct-needed true :no-as-needed true)
+                ")"))))
 
 (defn- generate-select
   "Converts a safe expression to an SQL select query."
   ([expr]
-     (generate-select expr #{} #{}))
-  ([expr exclude-vars constants]
-     (if (empty? (free-vars expr constants))
+     (generate-select expr #{} {}))
+  ([expr exclude-vars var-bindings & {:keys [no-distinct-needed no-as-needed]}]
+     (if (empty? (free-vars expr (keys var-bindings)))
        ;; a special top-level select to select a boolean expression,
        ;; since sql doesn't support selecting an empty tuple.
-       (str "SELECT " (generate-condition expr constants))
+       (str "SELECT " (generate-condition expr var-bindings))
        ;; an expression with some free variables:
        (match [expr]
               [(('and & clauses) :seq)]
-              (let [safe-clauses (filter #(safe? % constants) clauses)
-                    pseudosafe-clauses (filter #(not (safe? % constants)) clauses)
-                    tables (map #(table-binding % constants) safe-clauses)
-                    vars (table-bindings-to-var-bindings tables)
-                    eq-conds (var-bindings-to-equality-conditions vars)
-                    const-conds (table-bindings-to-constant-conditions tables)
-                    other-conds (map #(generate-condition % constants) pseudosafe-clauses)
-                    conds (concat eq-conds const-conds other-conds)
-                    from-exprs (map table-binding-to-from-expr tables)
-                    select-exprs (var-bindings-to-select-exprs vars exclude-vars)]
-
+              (let [safe-clauses (filter #(safe? % (keys var-bindings)) clauses)
+                    pseudosafe-clauses (filter #(not (safe? % (keys var-bindings))) clauses)
+                    tables (map #(table-binding % var-bindings) safe-clauses)
+                    var->cols (column-equiv-classes tables)
+                    equiv-conds (column-equiv-conds var->cols)
+                    eq-conds (column-eq-expr-conds tables)
+                    new-var-bindings (merge
+                                      var-bindings
+                                      (column-var-bindings var->cols))
+                    other-conds (map
+                                 #(generate-condition % new-var-bindings)
+                                 pseudosafe-clauses)
+                    conds (concat equiv-conds eq-conds other-conds)
+                    from-exprs (map from-expr tables)
+                    select-exprs (select-exprs var->cols exclude-vars no-as-needed)]
                 (str "SELECT "
-                     (when-not (empty? exclude-vars) "DISTINCT ")
-                     (str/join ", " select-exprs)
+                     (when-not no-distinct-needed "DISTINCT ")
+                     (if (empty? select-exprs)
+                       "true"
+                       (str/join ", " select-exprs))
                      " FROM "
                      (str/join ", " from-exprs)
                      (when-not (empty? conds)
                        (str " WHERE " (str/join " AND " conds)))))
 
               [(('or & clauses) :seq)]
-              (str/join " UNION " (map #(generate-select % exclude-vars constants) clauses))
+              (str/join " UNION " (map #(generate-select
+                                         % exclude-vars var-bindings
+                                         ;; UNION does a distinct for free
+                                         :no-distinct-needed true)
+                                       clauses))
 
               [(('exists [var] inner) :seq)]
-              (generate-select inner (set/union exclude-vars #{var}) constants)
+              (generate-select inner (set/union exclude-vars #{var}) var-bindings
+                               :no-distinct-needed no-distinct-needed
+                               :no-as-needed no-as-needed)
 
               [base-predicate]
-              (generate-select (list 'and base-predicate) exclude-vars constants)))))
+              (generate-select (list 'and base-predicate) exclude-vars var-bindings
+                               :no-distinct-needed no-distinct-needed
+                               :no-as-needed no-as-needed)))))
+
+(defn to-sql
+  [expr]
+  (let [norm-expr (normalize (desugar expr))]
+    (if (safe? norm-expr)
+      (with-pretty-gensym
+        (generate-select norm-expr))
+      (throw (IllegalArgumentException. "expression not safe to convert to SQL")))))
